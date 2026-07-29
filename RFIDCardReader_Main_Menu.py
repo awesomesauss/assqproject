@@ -34,8 +34,8 @@ reader = rfid_init()
 def display_idle():
     """Display the idle/waiting-for-card screen"""
     lcd_display.lcd_clear()
-    lcd_display.lcd_display_string("Tap RFID card", 1)
-    lcd_display.lcd_display_string("to begin...", 2)
+    lcd_display.lcd_display_string("RFID ACCESS", 1)
+    lcd_display.lcd_display_string("REQUIRED", 2)
 
 def display_goodbye():
     """Display the goodbye message after a timeout"""
@@ -86,12 +86,12 @@ def start_session():
     display_main_menu()
     reset_inactivity_timer()
 
-def end_session(show_goodbye=True):
+def end_session(goodbye=True):
     """Called when the session times out: deactivate the menu system"""
     global RFID_ACCESS
     with state_lock:
         RFID_ACCESS = False
-    if show_goodbye:
+    if goodbye:
         display_goodbye()
         time.sleep(2)  # let the user actually read "Goodbye!"
     display_idle()
@@ -161,7 +161,7 @@ def timeout_watcher():
             active = RFID_ACCESS
             elapsed = time.time() - last_activity_time
         if active and elapsed >= INACTIVITY_TIMEOUT:
-            end_session(show_goodbye=True)
+            end_session(goodbye=True)
 
 def keypad_thread():
     """Thread function to run the keypad get_key() blocking function"""
