@@ -8,7 +8,7 @@ import time
 import threading
 from hal.hal_keypad import init as keypad_init
 from hal.hal_lcd import lcd
-from mfrc522 import SimpleMFRC522
+from hal.hal_rfid_reader import init as rfid_init
 
 # Global variables for menu state
 current_menu = "MAIN"  # MAIN, CONTROL, MONITOR
@@ -26,7 +26,7 @@ state_lock = threading.Lock() # protects the state above since it's touched by m
 lcd_display = lcd()
 
 #Initialize RFID reader
-reader = SimpleMFRC522()
+reader = rfid_init()
 
 #---------------------------------------------------------------------------------------------------------------------------#
 # Functions to display menus on the LCD
@@ -34,8 +34,8 @@ reader = SimpleMFRC522()
 def display_idle():
     """Display the idle/waiting-for-card screen"""
     lcd_display.lcd_clear()
-    lcd_display.lcd_display_string("RFID ACCESS", 1)
-    lcd_display.lcd_display_string("REQUIRED", 2)
+    lcd_display.lcd_display_string("Tap RFID card", 1)
+    lcd_display.lcd_display_string("to begin...", 2)
 
 def display_goodbye():
     """Display the goodbye message after a timeout"""
@@ -45,8 +45,8 @@ def display_goodbye():
 def display_main_menu():
     """Display the main menu on LCD"""
     lcd_display.lcd_clear()
-    lcd_display.lcd_display_string("1: Control Car Sys", 1)
-    lcd_display.lcd_display_string("2: Monitor Car Sys", 2)
+    lcd_display.lcd_display_string("1: Control Car", 1)
+    lcd_display.lcd_display_string("2: Monitor Car", 2)
 
 def display_control_menu(page=0):
     """Display the Control Car Systems menu"""
@@ -86,12 +86,12 @@ def start_session():
     display_main_menu()
     reset_inactivity_timer()
 
-def end_session(goodbye=True):
+def end_session(show_goodbye=True):
     """Called when the session times out: deactivate the menu system"""
     global RFID_ACCESS
     with state_lock:
         RFID_ACCESS = False
-    if goodbye:
+    if show_goodbye:
         display_goodbye()
         time.sleep(2)  # let the user actually read "Goodbye!"
     display_idle()
@@ -139,7 +139,7 @@ def key_pressed(key):
 def rfid_thread():
     """Continuously waits for RFID card taps and starts a menu session on each tap"""
     while True:
-        # reader.read() is blocked, so this thread will wait here until a card is tapped
+        # reader.read() blocks until a card is presented
         card_id, text = reader.read()
         with state_lock:
             already_active = RFID_ACCESS
@@ -161,7 +161,7 @@ def timeout_watcher():
             active = RFID_ACCESS
             elapsed = time.time() - last_activity_time
         if active and elapsed >= INACTIVITY_TIMEOUT:
-            end_session(goodbye=True)
+            end_session(show_goodbye=True)
 
 def keypad_thread():
     """Thread function to run the keypad get_key() blocking function"""
