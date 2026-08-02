@@ -11,9 +11,11 @@ from hal.hal_keypad import init as keypad_init
 from hal.hal_lcd import lcd
 from hal.hal_rfid_reader import init as rfid_init
 from hal import hal_temp_humidity_sensor
+from hal import hal_dc_motor
+from hal import hal_servo
 
 # Global variables for menu state
-current_menu = "MAIN"  # MAIN, CONTROL, MONITOR, AC_CONTROL
+current_menu = "MAIN"  # MAIN, CONTROL, MONITOR, AC_CONTROL, ENGINE_CONTROL, DOOR_CONTROL
 control_menu_page = 0  # 0 or 1 (for scrolling between two views)
 monitor_menu_page = 0  # 0 only (no scrolling needed for monitor menu)
 
@@ -23,6 +25,15 @@ AC_TEMP_MAX = 30
 AC_TEMP_STEP = 1
 AC_TEMP_DEFAULT = 22
 ac_temp = AC_TEMP_DEFAULT
+
+# Engine control state
+ENGINE_RUN_SPEED = 60  # motor speed (0-100) while "running"
+engine_on = False
+
+# Door lock control state
+DOOR_LOCKED_POS = 0     # servo angle (degrees) when locked
+DOOR_UNLOCKED_POS = 90  # servo angle (degrees) when unlocked
+door_locked = True
 
 # Session / timeout state
 RFID_ACCESS = False        # True once a card has been tapped and menu is showing
@@ -86,6 +97,18 @@ def display_ac_control(temp):
     else:
         lcd_display.lcd_display_string(f"Cabin:{cabin_temp:.1f}C", 2)
 
+def display_engine_control():
+    """Display the Start Engine screen: current on/off state, toggled by key 1"""
+    lcd_display.lcd_clear()
+    lcd_display.lcd_display_string("Engine: " + ("ON" if engine_on else "OFF"), 1)
+    lcd_display.lcd_display_string("1:Toggle *:Back", 2)
+
+def display_door_control():
+    """Display the Lock/Unlock Door screen: current lock state, toggled by key 1"""
+    lcd_display.lcd_clear()
+    lcd_display.lcd_display_string("Door: " + ("LOCKED" if door_locked else "UNLOCKED"), 1)
+    lcd_display.lcd_display_string("1:Toggle *:Back", 2)
+
 #---------------------------------------------------------------------------------------------------------------------------#
 # Activity / session helpers
 #---------------------------------------------------------------------------------------------------------------------------#
@@ -118,7 +141,7 @@ def end_session(goodbye=True):
 #-------------------------------------------------------------------------------------------------------------------------------#
 def key_pressed(key):
     """Callback function for when a key is pressed on the keypad"""
-    global current_menu, control_menu_page, monitor_menu_page, ac_temp
+    global current_menu, control_menu_page, monitor_menu_page, ac_temp, engine_on, door_locked
     key = str(key)  # hal_keypad's MATRIX mixes ints (1-9,0) and strs ('*','#'); normalize here
 
     with state_lock:
@@ -143,6 +166,15 @@ def key_pressed(key):
                 current_menu = "AC_CONTROL"
                 ac_temp = AC_TEMP_DEFAULT
                 display_ac_control(ac_temp)
+            elif key == '2' and control_menu_page == 0:  # Select "Start Engine" (page 0 position)
+                current_menu = "ENGINE_CONTROL"
+                display_engine_control()
+            elif key == '1' and control_menu_page == 1:  # Select "Start Engine" (page 1 position)
+                current_menu = "ENGINE_CONTROL"
+                display_engine_control()
+            elif key == '2' and control_menu_page == 1:  # Select "Lock/Unlock Door"
+                current_menu = "DOOR_CONTROL"
+                display_door_control()
             elif key == '#':  # Scroll down (this keypad has no 'A' key)
                 control_menu_page = 1 - control_menu_page  # Toggle between 0 and 1
                 display_control_menu(control_menu_page)
@@ -157,6 +189,24 @@ def key_pressed(key):
             elif key == '8':  # Decrease temperature
                 ac_temp = max(AC_TEMP_MIN, ac_temp - AC_TEMP_STEP)
                 display_ac_control(ac_temp)
+            elif key == '*':  # Go back to Control Car Systems menu
+                current_menu = "CONTROL"
+                display_control_menu(control_menu_page)
+
+        elif current_menu == "ENGINE_CONTROL":
+            if key == '1':  # Toggle engine on/off
+                engine_on = not engine_on
+                hal_dc_motor.set_motor_speed(ENGINE_RUN_SPEED if engine_on else 0)
+                display_engine_control()
+            elif key == '*':  # Go back to Control Car Systems menu
+                current_menu = "CONTROL"
+                display_control_menu(control_menu_page)
+
+        elif current_menu == "DOOR_CONTROL":
+            if key == '1':  # Toggle door locked/unlocked
+                door_locked = not door_locked
+                hal_servo.set_servo_position(DOOR_LOCKED_POS if door_locked else DOOR_UNLOCKED_POS)
+                display_door_control()
             elif key == '*':  # Go back to Control Car Systems menu
                 current_menu = "CONTROL"
                 display_control_menu(control_menu_page)
@@ -212,6 +262,12 @@ def main():
     lcd_display.backlight(1)  # Turn on backlight
     keypad_init(key_pressed)
     hal_temp_humidity_sensor.init()  # DHT11 sensor used for AC/heating screen (REQ_14)
+    hal_dc_motor.init()   # drives the engine simulation motor
+    hal_servo.init()      # drives the door lock servo
+
+    # Sync actuators to the software's initial state (engine off, door locked)
+    hal_dc_motor.set_motor_speed(0)
+    hal_servo.set_servo_position(DOOR_LOCKED_POS)
 
     # Show idle screen until a card is tapped
     display_idle()
@@ -219,6 +275,7 @@ def main():
     print("System ready. Tap an RFID card to bring up the menu.")
     print("Keys: 1=Control Car Systems, 2=Monitor Car Systems, #=Scroll (in Control menu), *=Back")
     print("In AC/Heat Control: 2=Increase Temp, 8=Decrease Temp, *=Back")
+    print("In Start Engine / Lock-Unlock Door: 1=Toggle, *=Back")
     print(f"Menu will time out to 'Goodbye!' after {INACTIVITY_TIMEOUT}s of no input.")
 
     try:
