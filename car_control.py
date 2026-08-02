@@ -10,11 +10,19 @@ import threading
 from hal.hal_keypad import init as keypad_init
 from hal.hal_lcd import lcd
 from hal.hal_rfid_reader import init as rfid_init
+from hal import hal_temp_humidity_sensor
 
 # Global variables for menu state
-current_menu = "MAIN"  # MAIN, CONTROL, MONITOR
+current_menu = "MAIN"  # MAIN, CONTROL, MONITOR, AC_CONTROL
 control_menu_page = 0  # 0 or 1 (for scrolling between two views)
 monitor_menu_page = 0  # 0 only (no scrolling needed for monitor menu)
+
+# AC / Heat control state (REQ_14, REQ_17)
+AC_TEMP_MIN = 16
+AC_TEMP_MAX = 30
+AC_TEMP_STEP = 1
+AC_TEMP_DEFAULT = 22
+ac_temp = AC_TEMP_DEFAULT
 
 # Session / timeout state
 RFID_ACCESS = False        # True once a card has been tapped and menu is showing
@@ -65,6 +73,19 @@ def display_monitor_menu(page=0):
     lcd_display.lcd_display_string("Battery/Fuel Lvl", 1)
     lcd_display.lcd_display_string("Engine Temp", 2)
 
+def display_ac_control(temp):
+    """Display the AC/Heat control screen (REQ_14): shows the user's requested
+    setpoint alongside the actual cabin temperature read from the DHT11
+    sensor. Screen-only - no actuator is driven."""
+    lcd_display.lcd_clear()
+    lcd_display.lcd_display_string(f"Set:{temp}C", 1)
+
+    cabin_temp, _humidity = hal_temp_humidity_sensor.read_temp_humidity()
+    if cabin_temp == -100:  # sensor read failed/invalid
+        lcd_display.lcd_display_string("Cabin: N/A", 2)
+    else:
+        lcd_display.lcd_display_string(f"Cabin:{cabin_temp:.1f}C", 2)
+
 #---------------------------------------------------------------------------------------------------------------------------#
 # Activity / session helpers
 #---------------------------------------------------------------------------------------------------------------------------#
@@ -97,7 +118,7 @@ def end_session(goodbye=True):
 #-------------------------------------------------------------------------------------------------------------------------------#
 def key_pressed(key):
     """Callback function for when a key is pressed on the keypad"""
-    global current_menu, control_menu_page, monitor_menu_page
+    global current_menu, control_menu_page, monitor_menu_page, ac_temp
     key = str(key)  # hal_keypad's MATRIX mixes ints (1-9,0) and strs ('*','#'); normalize here
 
     with state_lock:
@@ -118,12 +139,27 @@ def key_pressed(key):
                 display_monitor_menu(0)
 
         elif current_menu == "CONTROL":
-            if key == '#':  # Scroll down (this keypad has no 'A' key)
+            if key == '1' and control_menu_page == 0:  # Select "AC/Heat Control" (REQ_14)
+                current_menu = "AC_CONTROL"
+                ac_temp = AC_TEMP_DEFAULT
+                display_ac_control(ac_temp)
+            elif key == '#':  # Scroll down (this keypad has no 'A' key)
                 control_menu_page = 1 - control_menu_page  # Toggle between 0 and 1
                 display_control_menu(control_menu_page)
             elif key == '*':  # Go back to main menu
                 current_menu = "MAIN"
                 display_main_menu()
+
+        elif current_menu == "AC_CONTROL":
+            if key == '2':  # Increase temperature
+                ac_temp = min(AC_TEMP_MAX, ac_temp + AC_TEMP_STEP)
+                display_ac_control(ac_temp)
+            elif key == '8':  # Decrease temperature
+                ac_temp = max(AC_TEMP_MIN, ac_temp - AC_TEMP_STEP)
+                display_ac_control(ac_temp)
+            elif key == '*':  # Go back to Control Car Systems menu
+                current_menu = "CONTROL"
+                display_control_menu(control_menu_page)
 
         elif current_menu == "MONITOR":
             if key == '*':  # Go back to main menu
@@ -175,12 +211,14 @@ def main():
 
     lcd_display.backlight(1)  # Turn on backlight
     keypad_init(key_pressed)
+    hal_temp_humidity_sensor.init()  # DHT11 sensor used for AC/heating screen (REQ_14)
 
     # Show idle screen until a card is tapped
     display_idle()
 
     print("System ready. Tap an RFID card to bring up the menu.")
     print("Keys: 1=Control Car Systems, 2=Monitor Car Systems, #=Scroll (in Control menu), *=Back")
+    print("In AC/Heat Control: 2=Increase Temp, 8=Decrease Temp, *=Back")
     print(f"Menu will time out to 'Goodbye!' after {INACTIVITY_TIMEOUT}s of no input.")
 
     try:
