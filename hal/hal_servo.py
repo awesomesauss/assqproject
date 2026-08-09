@@ -12,7 +12,7 @@ def init():
 def set_servo_position(position):
     PWM = GPIO.PWM(26, 50)  # set 50Hz PWM output at GPIO26
 
-    position = (-10*position)/180 + 12
+    position = (6.8*position)/180 + 2.7
 
     print("position = " + str(position))
 

@@ -5,6 +5,7 @@ Merged: menu navigation (Control/Monitor Car Systems) gated behind an
 RFID tap, with an inactivity timeout that returns to the idle screen.
 """
 
+import json
 import time
 import threading
 from hal.hal_keypad import init as keypad_init
@@ -32,13 +33,57 @@ engine_on = False
 
 # Door lock control state
 DOOR_LOCKED_POS = 0     # servo angle (degrees) when locked
-DOOR_UNLOCKED_POS = 90  # servo angle (degrees) when unlocked
+DOOR_UNLOCKED_POS = 180  # servo angle (degrees) when unlocked
 door_locked = True
+
+#---------------------------------------------------------------------------------------------------------------------------#
+# Settings persistence (AC temp, engine, door lock survive sessions/restarts)
+#---------------------------------------------------------------------------------------------------------------------------#
+SETTINGS_FILE = "car_settings.json"
+
+def load_settings():
+    """Load saved settings from disk into the global state. Missing/invalid
+    file is not an error - the defaults already set above are kept."""
+    global ac_temp, engine_on, door_locked
+    try:
+        with open(SETTINGS_FILE, "r") as f:
+            data = json.load(f)
+        if "ac_temp" in data:
+            ac_temp = int(data["ac_temp"])
+        if "engine_on" in data:
+            engine_on = bool(data["engine_on"])
+        if "door_locked" in data:
+            door_locked = bool(data["door_locked"])
+    except (FileNotFoundError, ValueError, OSError):
+        pass  # keep defaults
+
+def save_settings():
+    """Write the current settings to disk. Caller should already hold state_lock."""
+    data = {
+        "ac_temp": ac_temp,
+        "engine_on": engine_on,
+        "door_locked": door_locked,
+    }
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        print("Warning: could not save settings to " + SETTINGS_FILE)
 
 # Session / timeout state
 RFID_ACCESS = False        # True once a card has been tapped and menu is showing
 last_activity_time = time.time()
 INACTIVITY_TIMEOUT = 10    # seconds
+
+# Keypad debounce state: the keypad HAL scans the matrix in a loop and can
+# report the same key several times for one physical press/hold (no hardware
+# debounce). Without collapsing those duplicates, one press could toggle a
+# menu multiple times in a row, making it look like the menu changes on its
+# own. Any repeat of the same key within KEY_DEBOUNCE_SECONDS is treated as
+# part of the same physical press and ignored.
+last_key = None
+last_key_time = 0.0
+KEY_DEBOUNCE_SECONDS = 0.3
 
 state_lock = threading.Lock()  # protects the state above since it's touched by multiple threads
 
@@ -84,6 +129,33 @@ def display_monitor_menu(page=0):
     lcd_display.lcd_display_string("Battery/Fuel Lvl", 1)
     lcd_display.lcd_display_string("Engine Temp", 2)
 
+# DHT11 retry settings (single reads are flaky and frequently return invalid data)
+DHT_READ_RETRIES = 15
+DHT_RETRY_DELAY = 0.1   # seconds between attempts
+DHT_MIN_READ_INTERVAL = 0.5  # seconds minimum between read() calls
+_dht_last_read_time = 0.0
+
+def read_cabin_temp():
+    """Read the DHT11 cabin temperature with retries. Returns the temperature
+    in Celsius, or -100 if no valid reading was obtained."""
+    global _dht_last_read_time
+
+    # DHT11 needs a quiet period between reads
+    wait = DHT_MIN_READ_INTERVAL - (time.time() - _dht_last_read_time)
+    if wait > 0:
+        time.sleep(wait)
+
+    cabin_temp = -100
+    for _ in range(DHT_READ_RETRIES):
+        temp, _humidity = hal_temp_humidity_sensor.read_temp_humidity()
+        if temp != -100:
+            cabin_temp = temp
+            break
+        time.sleep(DHT_RETRY_DELAY)
+
+    _dht_last_read_time = time.time()
+    return cabin_temp
+
 def display_ac_control(temp):
     """Display the AC/Heat control screen (REQ_14): shows the user's requested
     setpoint alongside the actual cabin temperature read from the DHT11
@@ -91,7 +163,7 @@ def display_ac_control(temp):
     lcd_display.lcd_clear()
     lcd_display.lcd_display_string(f"Set:{temp}C", 1)
 
-    cabin_temp, _humidity = hal_temp_humidity_sensor.read_temp_humidity()
+    cabin_temp = read_cabin_temp()
     if cabin_temp == -100:  # sensor read failed/invalid
         lcd_display.lcd_display_string("Cabin: N/A", 2)
     else:
@@ -129,9 +201,12 @@ def start_session():
 
 def end_session(goodbye=True):
     """Called when the session times out: deactivate the menu system - caller must already hold state_lock"""
-    global RFID_ACCESS
+    global RFID_ACCESS, door_locked
     RFID_ACCESS = False
     if goodbye:
+        door_locked = True
+        hal_servo.set_servo_position(DOOR_LOCKED_POS)
+        save_settings()
         display_goodbye()
         time.sleep(2)  # let the user actually read "Goodbye!" (lock held so nothing else can write the LCD meanwhile)
     display_idle()
@@ -142,12 +217,22 @@ def end_session(goodbye=True):
 def key_pressed(key):
     """Callback function for when a key is pressed on the keypad"""
     global current_menu, control_menu_page, monitor_menu_page, ac_temp, engine_on, door_locked
+    global last_key, last_key_time
     key = str(key)  # hal_keypad's MATRIX mixes ints (1-9,0) and strs ('*','#'); normalize here
 
     with state_lock:
         # Ignore keypad input entirely until a card has been tapped
         if not RFID_ACCESS:
             return
+
+        # Collapse duplicate events from a single physical press (see
+        # KEY_DEBOUNCE_SECONDS above) so the menu doesn't toggle repeatedly
+        # on its own.
+        now = time.time()
+        if key == last_key and (now - last_key_time) < KEY_DEBOUNCE_SECONDS:
+            return
+        last_key = key
+        last_key_time = now
 
         reset_inactivity_timer()
 
@@ -164,7 +249,6 @@ def key_pressed(key):
         elif current_menu == "CONTROL":
             if key == '1' and control_menu_page == 0:  # Select "AC/Heat Control" (REQ_14)
                 current_menu = "AC_CONTROL"
-                ac_temp = AC_TEMP_DEFAULT
                 display_ac_control(ac_temp)
             elif key == '2' and control_menu_page == 0:  # Select "Start Engine" (page 0 position)
                 current_menu = "ENGINE_CONTROL"
@@ -186,9 +270,11 @@ def key_pressed(key):
             if key == '2':  # Increase temperature
                 ac_temp = min(AC_TEMP_MAX, ac_temp + AC_TEMP_STEP)
                 display_ac_control(ac_temp)
-            elif key == '8':  # Decrease temperature
+                save_settings()
+            elif key == '1':  # Decrease temperature
                 ac_temp = max(AC_TEMP_MIN, ac_temp - AC_TEMP_STEP)
                 display_ac_control(ac_temp)
+                save_settings()
             elif key == '*':  # Go back to Control Car Systems menu
                 current_menu = "CONTROL"
                 display_control_menu(control_menu_page)
@@ -197,6 +283,7 @@ def key_pressed(key):
             if key == '1':  # Toggle engine on/off
                 engine_on = not engine_on
                 hal_dc_motor.set_motor_speed(ENGINE_RUN_SPEED if engine_on else 0)
+                save_settings()
                 display_engine_control()
             elif key == '*':  # Go back to Control Car Systems menu
                 current_menu = "CONTROL"
@@ -206,6 +293,7 @@ def key_pressed(key):
             if key == '1':  # Toggle door locked/unlocked
                 door_locked = not door_locked
                 hal_servo.set_servo_position(DOOR_LOCKED_POS if door_locked else DOOR_UNLOCKED_POS)
+                save_settings()
                 display_door_control()
             elif key == '*':  # Go back to Control Car Systems menu
                 current_menu = "CONTROL"
@@ -265,16 +353,18 @@ def main():
     hal_dc_motor.init()   # drives the engine simulation motor
     hal_servo.init()      # drives the door lock servo
 
-    # Sync actuators to the software's initial state (engine off, door locked)
-    hal_dc_motor.set_motor_speed(0)
-    hal_servo.set_servo_position(DOOR_LOCKED_POS)
+    load_settings()  # restore AC temp / engine / door lock from last session
+
+    # Sync actuators to the restored state
+    hal_dc_motor.set_motor_speed(ENGINE_RUN_SPEED if engine_on else 0)
+    hal_servo.set_servo_position(DOOR_LOCKED_POS if door_locked else DOOR_UNLOCKED_POS)
 
     # Show idle screen until a card is tapped
     display_idle()
 
     print("System ready. Tap an RFID card to bring up the menu.")
     print("Keys: 1=Control Car Systems, 2=Monitor Car Systems, #=Scroll (in Control menu), *=Back")
-    print("In AC/Heat Control: 2=Increase Temp, 8=Decrease Temp, *=Back")
+    print("In AC/Heat Control: 2=Increase Temp, 1=Decrease Temp, *=Back")
     print("In Start Engine / Lock-Unlock Door: 1=Toggle, *=Back")
     print(f"Menu will time out to 'Goodbye!' after {INACTIVITY_TIMEOUT}s of no input.")
 
