@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# Telegram bot secrets - copy tele_config.example.json to this and fill in
+tele_config.json
+
+# Runtime state, not source
+car_settings.json
+captures/
