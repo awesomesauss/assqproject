@@ -16,7 +16,8 @@ from hal import hal_dc_motor
 from hal import hal_servo
 
 # Global variables for menu state
-current_menu = "MAIN"  # MAIN, CONTROL, MONITOR, AC_CONTROL, ENGINE_CONTROL, DOOR_CONTROL
+current_menu = "MAIN"  # MAIN, CONTROL, MONITOR, AC_CONTROL, ENGINE_CONTROL, DOOR_CONTROL,
+                        # FUEL_BATTERY_DISPLAY, ENGINE_TEMP_DISPLAY
 control_menu_page = 0  # 0 or 1 (for scrolling between two views)
 monitor_menu_page = 0  # 0 only (no scrolling needed for monitor menu)
 
@@ -35,6 +36,65 @@ engine_on = False
 DOOR_LOCKED_POS = 0     # servo angle (degrees) when locked
 DOOR_UNLOCKED_POS = 180  # servo angle (degrees) when unlocked
 door_locked = True
+
+#---------------------------------------------------------------------------------------------------------------------------#
+# Simulated fuel/battery/engine-temp readings (Monitor Car Systems screens)
+#---------------------------------------------------------------------------------------------------------------------------#
+# Engine temperature: starts cool and gradually climbs up to a max while the
+# engine is running. It only ramps up while `engine_on` is True, holds while
+# stopped, and resets back to the start temp once the engine is turned off.
+ENGINE_TEMP_START = 30       # degrees C when the engine is first started
+ENGINE_TEMP_MAX = 90         # degrees C once fully warmed up
+ENGINE_WARMUP_SECONDS = 120  # time it takes to go from START to MAX while running
+
+_engine_temp = float(ENGINE_TEMP_START)   # current simulated temperature
+_engine_temp_last_update = time.time()    # last time _engine_temp was advanced
+
+# Cache of what's currently on the LCD for the two monitor reading screens,
+# so the periodic refresh only redraws (and clears) when something visible
+# actually changed, instead of flickering every tick.
+_last_fuel_battery_shown = (None, None)
+_last_engine_temp_shown = None
+
+# Fuel level: starts full, drains relatively quickly
+FUEL_LEVEL_START = 100.0     # percent
+FUEL_DRAIN_RATE = 0.05       # percent per second (faster drain)
+
+# Battery level: starts full, drains more slowly than fuel
+BATTERY_LEVEL_START = 100.0  # percent
+BATTERY_DRAIN_RATE = 0.015   # percent per second (slower drain than fuel)
+
+SIM_START_TIME = time.time()  # reference point fuel/battery drain from
+
+def get_fuel_level():
+    """Simulated fuel level percentage that decreases over time."""
+    elapsed = time.time() - SIM_START_TIME
+    level = FUEL_LEVEL_START - (FUEL_DRAIN_RATE * elapsed)
+    return max(0, int(round(level)))
+
+def get_battery_level():
+    """Simulated battery level percentage that decreases over time, at a
+    slower rate than the fuel level."""
+    elapsed = time.time() - SIM_START_TIME
+    level = BATTERY_LEVEL_START - (BATTERY_DRAIN_RATE * elapsed)
+    return max(0, int(round(level)))
+
+def get_engine_temperature():
+    """Simulated engine temperature. Climbs from ENGINE_TEMP_START towards
+    ENGINE_TEMP_MAX while the engine is running, holds steady once at max
+    (or whenever the engine is off). Caller must already hold state_lock,
+    since it reads the `engine_on` global."""
+    global _engine_temp, _engine_temp_last_update
+
+    now = time.time()
+    elapsed = now - _engine_temp_last_update
+    _engine_temp_last_update = now
+
+    if engine_on and _engine_temp < ENGINE_TEMP_MAX:
+        degrees_per_second = (ENGINE_TEMP_MAX - ENGINE_TEMP_START) / ENGINE_WARMUP_SECONDS
+        _engine_temp = min(ENGINE_TEMP_MAX, _engine_temp + degrees_per_second * elapsed)
+
+    return int(round(_engine_temp))
 
 #---------------------------------------------------------------------------------------------------------------------------#
 # Settings persistence (AC temp, engine, door lock survive sessions/restarts)
@@ -126,8 +186,39 @@ def display_control_menu(page=0):
 def display_monitor_menu(page=0):
     """Display the Monitor Car Systems menu"""
     lcd_display.lcd_clear()
-    lcd_display.lcd_display_string("Battery/Fuel Lvl", 1)
-    lcd_display.lcd_display_string("Engine Temp", 2)
+    lcd_display.lcd_display_string("1:Battery/Fuel", 1)
+    lcd_display.lcd_display_string("2:Engine Temp", 2)
+
+def display_fuel_battery_levels(force=False):
+    """Display simulated fuel and battery levels on LCD.
+
+    Skips the redraw (and the lcd_clear() flicker that comes with it) if
+    the displayed values haven't actually changed since last time, unless
+    force=True (used when the screen is first entered)."""
+    global _last_fuel_battery_shown
+    fuel_level = get_fuel_level()
+    battery_level = get_battery_level()
+    if not force and (fuel_level, battery_level) == _last_fuel_battery_shown:
+        return
+    _last_fuel_battery_shown = (fuel_level, battery_level)
+    lcd_display.lcd_clear()
+    lcd_display.lcd_display_string(f"Fuel: {fuel_level}%", 1)
+    lcd_display.lcd_display_string(f"Battery: {battery_level}%", 2)
+
+def display_engine_temp_reading(force=False):
+    """Display simulated engine temperature on LCD.
+
+    Skips the redraw (and the lcd_clear() flicker that comes with it) if
+    the displayed value hasn't actually changed since last time, unless
+    force=True (used when the screen is first entered)."""
+    global _last_engine_temp_shown
+    engine_temp = get_engine_temperature()
+    if not force and engine_temp == _last_engine_temp_shown:
+        return
+    _last_engine_temp_shown = engine_temp
+    lcd_display.lcd_clear()
+    lcd_display.lcd_display_string("Engine Temp:", 1)
+    lcd_display.lcd_display_string(f"{engine_temp}C  *:Back", 2)
 
 # DHT11 retry settings (single reads are flaky and frequently return invalid data)
 DHT_READ_RETRIES = 15
@@ -217,7 +308,7 @@ def end_session(goodbye=True):
 def key_pressed(key):
     """Callback function for when a key is pressed on the keypad"""
     global current_menu, control_menu_page, monitor_menu_page, ac_temp, engine_on, door_locked
-    global last_key, last_key_time
+    global last_key, last_key_time, _engine_temp
     key = str(key)  # hal_keypad's MATRIX mixes ints (1-9,0) and strs ('*','#'); normalize here
 
     with state_lock:
@@ -283,6 +374,9 @@ def key_pressed(key):
             if key == '1':  # Toggle engine on/off
                 engine_on = not engine_on
                 hal_dc_motor.set_motor_speed(ENGINE_RUN_SPEED if engine_on else 0)
+                if not engine_on:
+                    # Engine stopped - reset the simulated temperature back to cold-start
+                    _engine_temp = float(ENGINE_TEMP_START)
                 save_settings()
                 display_engine_control()
             elif key == '*':  # Go back to Control Car Systems menu
@@ -300,9 +394,25 @@ def key_pressed(key):
                 display_control_menu(control_menu_page)
 
         elif current_menu == "MONITOR":
-            if key == '*':  # Go back to main menu
+            if key == '1':  # Select "Battery/Fuel Lvl"
+                current_menu = "FUEL_BATTERY_DISPLAY"
+                display_fuel_battery_levels(force=True)
+            elif key == '2':  # Select "Engine Temp"
+                current_menu = "ENGINE_TEMP_DISPLAY"
+                display_engine_temp_reading(force=True)
+            elif key == '*':  # Go back to main menu
                 current_menu = "MAIN"
                 display_main_menu()
+
+        elif current_menu == "FUEL_BATTERY_DISPLAY":
+            if key == '*':  # Go back to Monitor Car Systems menu
+                current_menu = "MONITOR"
+                display_monitor_menu(monitor_menu_page)
+
+        elif current_menu == "ENGINE_TEMP_DISPLAY":
+            if key == '*':  # Go back to Monitor Car Systems menu
+                current_menu = "MONITOR"
+                display_monitor_menu(monitor_menu_page)
 
 #-------------------------------------------------------------------------------------------------------------------------------#
 # RFID scanning logic
@@ -338,6 +448,20 @@ def timeout_watcher():
             if RFID_ACCESS and elapsed >= INACTIVITY_TIMEOUT:
                 end_session(goodbye=True)
 
+def monitor_refresh_watcher():
+    """While either monitor reading screen is being shown, periodically
+    refresh it so the simulated fuel/battery/engine-temp values visibly
+    change over time instead of only updating on a keypress."""
+    while True:
+        time.sleep(1)
+        with state_lock:
+            if not RFID_ACCESS:
+                continue
+            if current_menu == "FUEL_BATTERY_DISPLAY":
+                display_fuel_battery_levels()
+            elif current_menu == "ENGINE_TEMP_DISPLAY":
+                display_engine_temp_reading()
+
 def keypad_thread():
     """Thread function to run the keypad get_key() blocking function"""
     from hal.hal_keypad import get_key
@@ -366,6 +490,7 @@ def main():
     print("Keys: 1=Control Car Systems, 2=Monitor Car Systems, #=Scroll (in Control menu), *=Back")
     print("In AC/Heat Control: 2=Increase Temp, 1=Decrease Temp, *=Back")
     print("In Start Engine / Lock-Unlock Door: 1=Toggle, *=Back")
+    print("In Monitor Car Systems: 1=Battery/Fuel Lvl, 2=Engine Temp, *=Back")
     print(f"Menu will time out to 'Goodbye!' after {INACTIVITY_TIMEOUT}s of no input.")
 
     try:
@@ -377,6 +502,9 @@ def main():
 
         timeout_thread_obj = threading.Thread(target=timeout_watcher, daemon=True)
         timeout_thread_obj.start()
+
+        monitor_thread_obj = threading.Thread(target=monitor_refresh_watcher, daemon=True)
+        monitor_thread_obj.start()
 
         while True:
             time.sleep(0.1)
