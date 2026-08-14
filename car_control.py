@@ -14,6 +14,7 @@ from hal.hal_rfid_reader import init as rfid_init
 from hal import hal_temp_humidity_sensor
 from hal import hal_dc_motor
 from hal import hal_servo
+from anti_theft import AntiTheftMonitor
 
 # Global variables for menu state
 current_menu = "MAIN"  # MAIN, CONTROL, MONITOR, AC_CONTROL, ENGINE_CONTROL, DOOR_CONTROL,
@@ -272,6 +273,35 @@ def display_door_control():
     lcd_display.lcd_display_string("Door: " + ("LOCKED" if door_locked else "UNLOCKED"), 1)
     lcd_display.lcd_display_string("1:Toggle *:Back", 2)
 
+def display_theft_alert():
+    """Display the anti-theft warning screen"""
+    lcd_display.lcd_clear()
+    lcd_display.lcd_display_string("!!! WARNING !!!", 1)
+    lcd_display.lcd_display_string("Theft Detected!", 2)
+
+def redraw_current_screen():
+    """Redraw whatever screen should currently be showing, based on menu/session
+    state. Used to restore the display after a transient screen (the theft
+    alert). Caller must already hold state_lock."""
+    if not RFID_ACCESS:
+        display_idle()
+    elif current_menu == "MAIN":
+        display_main_menu()
+    elif current_menu == "CONTROL":
+        display_control_menu(control_menu_page)
+    elif current_menu == "AC_CONTROL":
+        display_ac_control(ac_temp)
+    elif current_menu == "ENGINE_CONTROL":
+        display_engine_control()
+    elif current_menu == "DOOR_CONTROL":
+        display_door_control()
+    elif current_menu == "MONITOR":
+        display_monitor_menu(monitor_menu_page)
+    elif current_menu == "FUEL_BATTERY_DISPLAY":
+        display_fuel_battery_levels(force=True)
+    elif current_menu == "ENGINE_TEMP_DISPLAY":
+        display_engine_temp_reading(force=True)
+
 #---------------------------------------------------------------------------------------------------------------------------#
 # Activity / session helpers
 #---------------------------------------------------------------------------------------------------------------------------#
@@ -316,11 +346,14 @@ def key_pressed(key):
         if not RFID_ACCESS:
             return
 
-        # Collapse duplicate events from a single physical press (see
-        # KEY_DEBOUNCE_SECONDS above) so the menu doesn't toggle repeatedly
-        # on its own.
+        # Collapse events from a single physical press (see KEY_DEBOUNCE_SECONDS
+        # above) so the menu doesn't toggle on its own. The keypad HAL can
+        # report bounce/noise as several presses very close together - if those
+        # repeats are of a *different* key they'd jump the menu, so ignore ANY
+        # press too soon after the last registered one, not just repeats of the
+        # same key.
         now = time.time()
-        if key == last_key and (now - last_key_time) < KEY_DEBOUNCE_SECONDS:
+        if (now - last_key_time) < KEY_DEBOUNCE_SECONDS:
             return
         last_key = key
         last_key_time = now
@@ -483,6 +516,17 @@ def main():
     hal_dc_motor.set_motor_speed(ENGINE_RUN_SPEED if engine_on else 0)
     hal_servo.set_servo_position(DOOR_LOCKED_POS if door_locked else DOOR_UNLOCKED_POS)
 
+    # Anti-theft monitor (REQ_18): sudden accelerometer movement while the
+    # doors are locked sounds the buzzer and shows a warning on the LCD.
+    antitheft = AntiTheftMonitor(
+        state_lock,
+        is_locked=lambda: door_locked,
+        show_alert=display_theft_alert,
+        restore_screen=redraw_current_screen,
+    )
+    antitheft.init()
+    antitheft.start()
+
     # Show idle screen until a card is tapped
     display_idle()
 
@@ -511,6 +555,7 @@ def main():
 
     except KeyboardInterrupt:
         print("\nShutting down...")
+        antitheft.stop()
         lcd_display.lcd_clear()
         lcd_display.backlight(0)  # Turn off backlight
 
