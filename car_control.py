@@ -15,6 +15,7 @@ from hal import hal_temp_humidity_sensor
 from hal import hal_dc_motor
 from hal import hal_servo
 from anti_theft import AntiTheftMonitor
+from tele import TelegramBot
 
 # Global variables for menu state
 current_menu = "MAIN"  # MAIN, CONTROL, MONITOR, AC_CONTROL, ENGINE_CONTROL, DOOR_CONTROL,
@@ -303,6 +304,48 @@ def redraw_current_screen():
         display_engine_temp_reading(force=True)
 
 #---------------------------------------------------------------------------------------------------------------------------#
+# Telegram remote control (tele.py) - callbacks passed to TelegramBot
+#---------------------------------------------------------------------------------------------------------------------------#
+def get_status():
+    """Snapshot of car state for the Telegram /status command."""
+    with state_lock:
+        return {
+            "door_locked": door_locked,
+            "engine_on": engine_on,
+            "fuel": get_fuel_level(),
+            "battery": get_battery_level(),
+            "engine_temp": get_engine_temperature(),
+            "cabin_temp": read_cabin_temp(),
+        }
+
+def remote_set_door_locked(locked):
+    """Lock/unlock the door from a Telegram command. Mirrors the keypad's
+    Lock/Unlock Door toggle, but sets an explicit direction instead of
+    toggling, and redraws the LCD only if that screen is currently shown."""
+    global door_locked
+    with state_lock:
+        door_locked = locked
+        hal_servo.set_servo_position(DOOR_LOCKED_POS if door_locked else DOOR_UNLOCKED_POS)
+        save_settings()
+        if current_menu == "DOOR_CONTROL":
+            display_door_control()
+
+def remote_set_engine_on(on):
+    """Start/stop the engine from a Telegram command. Mirrors the keypad's
+    Start Engine toggle - see remote_set_door_locked for why it's explicit
+    rather than a toggle."""
+    global engine_on, _engine_temp
+    with state_lock:
+        engine_on = on
+        hal_dc_motor.set_motor_speed(ENGINE_RUN_SPEED if engine_on else 0)
+        if not engine_on:
+            # Engine stopped - reset the simulated temperature back to cold-start
+            _engine_temp = float(ENGINE_TEMP_START)
+        save_settings()
+        if current_menu == "ENGINE_CONTROL":
+            display_engine_control()
+
+#---------------------------------------------------------------------------------------------------------------------------#
 # Activity / session helpers
 #---------------------------------------------------------------------------------------------------------------------------#
 def reset_inactivity_timer():
@@ -516,16 +559,50 @@ def main():
     hal_dc_motor.set_motor_speed(ENGINE_RUN_SPEED if engine_on else 0)
     hal_servo.set_servo_position(DOOR_LOCKED_POS if door_locked else DOOR_UNLOCKED_POS)
 
+    # Telegram remote control: lock/unlock, start/stop engine, /status, and
+    # a push alert when the anti-theft alarm triggers. Disables itself (see
+    # tele.py) if no bot token / allowed chat IDs are configured.
+    telegram_bot = TelegramBot(
+        controls={
+            "get_status": get_status,
+            "lock_door": lambda: remote_set_door_locked(True),
+            "unlock_door": lambda: remote_set_door_locked(False),
+            "engine_on": lambda: remote_set_engine_on(True),
+            "engine_off": lambda: remote_set_engine_on(False),
+        }
+    )
+    telegram_bot.start()
+
+    def show_theft_alert():
+        display_theft_alert()
+        telegram_bot.notify_text("Possible theft detected! Sudden movement while doors were locked.")
+
+    def on_theft_photo(photo_path):
+        # Called after the anti-theft capture completes: send the break-in
+        # notification with the evidence photo attached. If the camera
+        # produced no photo, fall back to a plain text alert.
+        if photo_path:
+            telegram_bot.notify_photo(
+                photo_path,
+                caption="ALERT: possible theft - sudden movement while doors were locked!",
+            )
+        else:
+            telegram_bot.notify_text("ALERT: possible theft detected (no photo - camera unavailable).")
+
     # Anti-theft monitor (REQ_18): sudden accelerometer movement while the
-    # doors are locked sounds the buzzer and shows a warning on the LCD.
+    # doors are locked sounds the buzzer, shows a warning on the LCD, snaps an
+    # evidence photo, and pushes the alert + photo to Telegram.
     antitheft = AntiTheftMonitor(
         state_lock,
         is_locked=lambda: door_locked,
-        show_alert=display_theft_alert,
+        show_alert=show_theft_alert,
         restore_screen=redraw_current_screen,
+        on_alert=on_theft_photo,
     )
     antitheft.init()
     antitheft.start()
+    print(f"Anti-theft monitoring armed. Door locked = {door_locked}. "
+          "Sudden movement will only trigger the alarm while the doors are locked.")
 
     # Show idle screen until a card is tapped
     display_idle()
@@ -556,6 +633,7 @@ def main():
     except KeyboardInterrupt:
         print("\nShutting down...")
         antitheft.stop()
+        telegram_bot.stop()
         lcd_display.lcd_clear()
         lcd_display.backlight(0)  # Turn off backlight
 
