@@ -1,4 +1,7 @@
 __pycache__/
+*.pyc
+
+.vscode/
 
 # Telegram bot secrets - copy tele_config.example.json to this and fill in
 tele_config.json
