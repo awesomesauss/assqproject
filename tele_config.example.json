@@ -1,4 +1,5 @@
 {
   "token": "123456789:AAExampleBotFatherTokenGoesHere",
-  "chat_ids": [123456789]
+  "chat_ids": [123456789],
+  "password": "change-me"
 }

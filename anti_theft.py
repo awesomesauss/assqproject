@@ -130,6 +130,7 @@ class _Camera:
 
 class AntiTheftMonitor:
     def __init__(self, state_lock, is_locked, show_alert, restore_screen,
+                 on_alert=None,
                  threshold=DEFAULT_ACCEL_THRESHOLD,
                  poll_interval=DEFAULT_POLL_INTERVAL,
                  buzz_duration=DEFAULT_BUZZ_DURATION,
@@ -138,6 +139,7 @@ class AntiTheftMonitor:
         self.is_locked = is_locked
         self.show_alert = show_alert
         self.restore_screen = restore_screen
+        self.on_alert = on_alert  # callable(photo_path_or_None) -> notify after capture
         self.threshold = threshold
         self.poll_interval = poll_interval
         self.buzz_duration = buzz_duration
@@ -151,13 +153,23 @@ class AntiTheftMonitor:
 
     def init(self):
         """Set up the accelerometer, buzzer and camera. Call once before
-        start(). Camera init failures are non-fatal."""
-        self._accel = hal_accelerometer.init()
-        hal_buzzer.init()
+        start(). Any init failure is non-fatal and logged, so a sensor/bus
+        problem never prevents the rest of the car control app from starting."""
+        try:
+            self._accel = hal_accelerometer.init()
+        except Exception as exc:
+            print("Warning: accelerometer init failed (" + str(exc) + ") - anti-theft disabled.")
+        try:
+            hal_buzzer.init()
+        except Exception as exc:
+            print("Warning: buzzer init failed (" + str(exc) + ")")
         self._camera.open()
 
     def start(self):
-        """Start the background monitoring thread."""
+        """Start the background monitoring thread. No-op if the accelerometer
+        failed to initialize."""
+        if self._accel is None:
+            return
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
@@ -174,25 +186,30 @@ class AntiTheftMonitor:
     def _capture_photo(self):
         """Take a timestamped evidence photo into the capture directory.
         Runs in its own thread so a slow camera never delays the buzzer or
-        the screen restore. Fails gracefully (just a log line)."""
+        the screen restore. Fails gracefully (just a log line). Returns the
+        saved photo path, or None if no photo was taken."""
         try:
             os.makedirs(self.capture_dir, exist_ok=True)
         except OSError as exc:
             print("Warning: cannot create capture dir (" + str(exc) + ")")
-            return
+            return None
 
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = os.path.join(self.capture_dir, "theft_" + stamp + ".jpg")
         if self._camera.capture(path):
             print("Photo saved: " + path)
+            return path
         else:
             print("Warning: could not take theft photo (camera not available or capture failed)")
+            return None
 
     def _trigger_alarm(self):
         """Show the warning, snap an evidence photo and sound the buzzer for
         buzz_duration seconds. The buzzer and photo run outside state_lock so
         other threads aren't blocked while they work; the LCD calls happen
-        under the lock like every other display update in the app."""
+        under the lock like every other display update in the app. If an
+        on_alert callback was supplied, it is invoked with the captured photo
+        path (or None) once the photo has been taken."""
         with self.state_lock:
             if self._alarm_active:
                 return  # already sounding - don't stack overlapping alarms
@@ -200,8 +217,10 @@ class AntiTheftMonitor:
             self.show_alert()
 
         print("!!! WARNING: sudden movement detected while doors are locked - possible theft !!!")
-        threading.Thread(target=self._capture_photo, daemon=True).start()
+        photo_path = self._capture_photo()  # synchronous, so on_alert can send the photo
         hal_buzzer.turn_on()
+        if self.on_alert is not None:
+            self.on_alert(photo_path)
         self._stop_event.wait(self.buzz_duration)  # returns early on stop()
         hal_buzzer.turn_off()
 
@@ -221,7 +240,18 @@ class AntiTheftMonitor:
             if self._stop_event.wait(self.poll_interval):
                 break  # stop() was called
 
-            x, y, z = self._accel.get_3_axis()
+            # The ADXL345 sits on the same I2C bus as the LCD, and reads can
+            # occasionally fail with a transient bus error (Errno 121) when
+            # another device is mid-transfer or the bus is getting a lot of
+            # traffic. Treat a failed sample as "no movement" - skip it and
+            # try again next poll instead of killing the monitor thread.
+            try:
+                x, y, z = self._accel.get_3_axis()
+            except OSError as exc:
+                print("Warning: accelerometer read failed (" + str(exc) + ")", end="\r")
+                prev_magnitude = None  # restart the delta baseline after a gap
+                continue
+
             magnitude = (x ** 2 + y ** 2 + z ** 2) ** 0.5
 
             if prev_magnitude is not None:

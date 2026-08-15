@@ -577,16 +577,32 @@ def main():
         display_theft_alert()
         telegram_bot.notify_text("Possible theft detected! Sudden movement while doors were locked.")
 
+    def on_theft_photo(photo_path):
+        # Called after the anti-theft capture completes: send the break-in
+        # notification with the evidence photo attached. If the camera
+        # produced no photo, fall back to a plain text alert.
+        if photo_path:
+            telegram_bot.notify_photo(
+                photo_path,
+                caption="ALERT: possible theft - sudden movement while doors were locked!",
+            )
+        else:
+            telegram_bot.notify_text("ALERT: possible theft detected (no photo - camera unavailable).")
+
     # Anti-theft monitor (REQ_18): sudden accelerometer movement while the
-    # doors are locked sounds the buzzer and shows a warning on the LCD.
+    # doors are locked sounds the buzzer, shows a warning on the LCD, snaps an
+    # evidence photo, and pushes the alert + photo to Telegram.
     antitheft = AntiTheftMonitor(
         state_lock,
         is_locked=lambda: door_locked,
         show_alert=show_theft_alert,
         restore_screen=redraw_current_screen,
+        on_alert=on_theft_photo,
     )
     antitheft.init()
     antitheft.start()
+    print(f"Anti-theft monitoring armed. Door locked = {door_locked}. "
+          "Sudden movement will only trigger the alarm while the doors are locked.")
 
     # Show idle screen until a card is tapped
     display_idle()
