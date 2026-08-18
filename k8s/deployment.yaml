@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: car-control-app
+  namespace: car-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: car-control
+  template:
+    metadata:
+      labels:
+        app: car-control
+    spec:
+      containers:
+        - name: car-control-container
+          image: your_docker_username/car-control:latest
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          envFrom:
+            - secretRef:
+                name: car-control-secret
+            - configMapRef:
+                name: car-control-config
+          volumeMounts:
+            - name: dev-gpiomem
+              mountPath: /dev/gpiomem
+            - name: dev-i2c
+              mountPath: /dev/i2c-1
+            - name: dev-spidev
+              mountPath: /dev/spidev0.0
+            - name: persistent-storage
+              mountPath: /app/captures
+      volumes:
+        - name: dev-gpiomem
+          hostPath:
+            path: /dev/gpiomem
+        - name: dev-i2c
+          hostPath:
+            path: /dev/i2c-1
+        - name: dev-spidev
+          hostPath:
+            path: /dev/spidev0.0
+        - name: persistent-storage
+          persistentVolumeClaim:
+            claimName: car-data-pvc
