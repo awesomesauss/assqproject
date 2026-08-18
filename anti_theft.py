@@ -1,29 +1,3 @@
-#!/usr/bin/env python3
-"""
-Anti-Theft Monitor Module (REQ_18)
-
-Reusable anti-theft monitor for the Car Control System. Polls the
-accelerometer for sudden movement and, if the doors are locked at the time,
-sounds the buzzer and shows a warning on the LCD.
-
-The module is UI-agnostic: the host application (e.g. car_control.py) passes
-three callbacks it uses to talk to the display and the door-lock state:
-  - is_locked:      callable() -> bool     whether the doors are locked
-  - show_alert:     callable()             show the theft warning screen
-  - restore_screen: callable()             redraw the screen that showed before
-
-The `is_locked`, `show_alert` and `restore_screen` callbacks that touch shared
-state / the LCD are invoked while holding the `state_lock` passed to the
-constructor, matching how the rest of the car control app serializes LCD
-access. Everything sensor/actuator/logic related (accelerometer, buzzer,
-camera, threading, alarm state machine) lives here. No HAL files are modified.
-
-When an alarm triggers, the Pi camera snaps a timestamped photo into the
-capture directory as evidence. Backends, tried in order: picamera2,
-libcamera-still, then legacy picamera. If no camera is available the alarm
-still works - the photo is simply skipped.
-"""
-
 import datetime
 import os
 import shutil
@@ -34,29 +8,22 @@ import time
 from hal import hal_accelerometer
 from hal import hal_buzzer
 
-# Defaults (configurable via the AntiTheftMonitor constructor)
-DEFAULT_ACCEL_THRESHOLD = 0.5   # g's of change between reads that counts as "sudden"
-DEFAULT_POLL_INTERVAL   = 0.2   # seconds between accelerometer samples
-DEFAULT_BUZZ_DURATION   = 3     # seconds the buzzer/warning stays on once triggered
-DEFAULT_CAPTURE_DIR     = "captures"  # folder for theft photos
+# Default configuration settings
+DEFAULT_ACCEL_THRESHOLD = 0.5
+DEFAULT_POLL_INTERVAL = 0.2
+DEFAULT_BUZZ_DURATION = 3
+DEFAULT_CAPTURE_DIR = "captures"
 
 
 class _Camera:
-    """Thin wrapper around the Raspberry Pi camera so capture failures can
-    never crash the alarm. Backends, tried in order:
-      1. picamera2 (Python libcamera bindings) - preferred.
-      2. `libcamera-still` CLI (ships with libcamera-apps; no extra Python
-         packages needed - works without internet).
-      3. Legacy `picamera` driver (old OS images only).
-    Not thread-safe on its own - the caller serializes access (and the alarm
-    state machine guarantees at most one capture at a time anyway)."""
+    """Helper class to manage Raspberry Pi camera capture."""
 
     def __init__(self):
-        self._impl = None  # ("picamera2" | "cli" | "picamera", camera_object_or_None)
+        self._impl = None
         self._lock = threading.Lock()
 
     def open(self):
-        """Try to initialize the camera. Failures are logged, not raised."""
+        # Try initializing picamera2 first
         try:
             from picamera2 import Picamera2
             cam = Picamera2()
@@ -68,11 +35,13 @@ class _Camera:
         except Exception as picamera2_exc:
             print("Warning: picamera2 init failed (" + str(picamera2_exc) + ")")
 
+        # Fallback to libcamera-still command line
         if shutil.which("libcamera-still"):
             self._impl = ("cli", None)
             print("Camera ready (libcamera-still)")
             return
 
+        # Fallback to legacy picamera
         try:
             import picamera
             cam = picamera.PiCamera()
@@ -83,7 +52,7 @@ class _Camera:
             print("Warning: camera unavailable - theft photos disabled (" + str(exc) + ")")
 
     def capture(self, path):
-        """Take a photo and save it to `path`. Returns True on success."""
+        # Take photo and save to path
         with self._lock:
             if self._impl is None:
                 return False
@@ -92,8 +61,6 @@ class _Camera:
                 if kind == "picamera2":
                     cam.capture_file(path)
                 elif kind == "cli":
-                    # --nopreview so it doesn't try to open a window headless;
-                    # --timeout lets auto-exposure settle before the still.
                     result = subprocess.run(
                         ["libcamera-still", "--output", path, "--nopreview", "--timeout", "2000"],
                         capture_output=True, timeout=20,
@@ -102,7 +69,7 @@ class _Camera:
                         detail = result.stderr.decode(errors="replace").strip()
                         print("Warning: libcamera-still failed (" + detail + ")")
                         return False
-                else:  # picamera
+                else:
                     cam.capture(path)
                 return True
             except Exception as exc:
@@ -124,7 +91,6 @@ class _Camera:
                     cam.close()
                 except Exception:
                     pass
-            # "cli" backend needs no cleanup
             self._impl = None
 
 
@@ -139,7 +105,7 @@ class AntiTheftMonitor:
         self.is_locked = is_locked
         self.show_alert = show_alert
         self.restore_screen = restore_screen
-        self.on_alert = on_alert  # callable(photo_path_or_None) -> notify after capture
+        self.on_alert = on_alert
         self.threshold = threshold
         self.poll_interval = poll_interval
         self.buzz_duration = buzz_duration
@@ -152,9 +118,7 @@ class AntiTheftMonitor:
         self._stop_event = threading.Event()
 
     def init(self):
-        """Set up the accelerometer, buzzer and camera. Call once before
-        start(). Any init failure is non-fatal and logged, so a sensor/bus
-        problem never prevents the rest of the car control app from starting."""
+        # Initialize sensors and camera
         try:
             self._accel = hal_accelerometer.init()
         except Exception as exc:
@@ -166,8 +130,7 @@ class AntiTheftMonitor:
         self._camera.open()
 
     def start(self):
-        """Start the background monitoring thread. No-op if the accelerometer
-        failed to initialize."""
+        # Start background polling thread
         if self._accel is None:
             return
         if self._thread is not None and self._thread.is_alive():
@@ -177,17 +140,13 @@ class AntiTheftMonitor:
         self._thread.start()
 
     def stop(self):
-        """Signal the monitoring thread to stop, silence the buzzer and close
-        the camera."""
+        # Stop background thread and turn off buzzer
         self._stop_event.set()
         hal_buzzer.turn_off()
         self._camera.close()
 
     def _capture_photo(self):
-        """Take a timestamped evidence photo into the capture directory.
-        Runs in its own thread so a slow camera never delays the buzzer or
-        the screen restore. Fails gracefully (just a log line). Returns the
-        saved photo path, or None if no photo was taken."""
+        # Create directory and take photo with timestamp
         try:
             os.makedirs(self.capture_dir, exist_ok=True)
         except OSError as exc:
@@ -204,24 +163,19 @@ class AntiTheftMonitor:
             return None
 
     def _trigger_alarm(self):
-        """Show the warning, snap an evidence photo and sound the buzzer for
-        buzz_duration seconds. The buzzer and photo run outside state_lock so
-        other threads aren't blocked while they work; the LCD calls happen
-        under the lock like every other display update in the app. If an
-        on_alert callback was supplied, it is invoked with the captured photo
-        path (or None) once the photo has been taken."""
+        # Sound buzzer, show alert screen, and capture evidence photo
         with self.state_lock:
             if self._alarm_active:
-                return  # already sounding - don't stack overlapping alarms
+                return
             self._alarm_active = True
             self.show_alert()
 
         print("!!! WARNING: sudden movement detected while doors are locked - possible theft !!!")
-        photo_path = self._capture_photo()  # synchronous, so on_alert can send the photo
+        photo_path = self._capture_photo()
         hal_buzzer.turn_on()
         if self.on_alert is not None:
             self.on_alert(photo_path)
-        self._stop_event.wait(self.buzz_duration)  # returns early on stop()
+        self._stop_event.wait(self.buzz_duration)
         hal_buzzer.turn_off()
 
         with self.state_lock:
@@ -229,27 +183,18 @@ class AntiTheftMonitor:
             self.restore_screen()
 
     def _run(self):
-        """Continuously poll the accelerometer for sudden speed changes.
-        - Doors locked + sudden change  -> sound buzzer, show warning.
-        - Doors unlocked + sudden change -> ignored, nothing happens.
-        Runs regardless of RFID session state, since theft attempts are most
-        likely while nobody has tapped in."""
+        # Main loop checking accelerometer readings
         prev_magnitude = None
 
         while True:
             if self._stop_event.wait(self.poll_interval):
-                break  # stop() was called
+                break
 
-            # The ADXL345 sits on the same I2C bus as the LCD, and reads can
-            # occasionally fail with a transient bus error (Errno 121) when
-            # another device is mid-transfer or the bus is getting a lot of
-            # traffic. Treat a failed sample as "no movement" - skip it and
-            # try again next poll instead of killing the monitor thread.
             try:
                 x, y, z = self._accel.get_3_axis()
             except OSError as exc:
                 print("Warning: accelerometer read failed (" + str(exc) + ")", end="\r")
-                prev_magnitude = None  # restart the delta baseline after a gap
+                prev_magnitude = None
                 continue
 
             magnitude = (x ** 2 + y ** 2 + z ** 2) ** 0.5
@@ -261,14 +206,11 @@ class AntiTheftMonitor:
                         locked = self.is_locked()
                     if locked:
                         self._trigger_alarm()
-                    # else: doors unlocked - sudden movement is expected/ignored
 
             prev_magnitude = magnitude
 
 
 if __name__ == "__main__":
-    # Standalone mode (for testing without the car control UI): treat the
-    # doors as always locked, and report alerts to the console.
     def console_alert():
         print("!!! WARNING !!! Theft Detected!")
 

@@ -1,46 +1,3 @@
-#!/usr/bin/env python3
-"""
-Telegram Remote Control Module
-
-Reusable Telegram bot for the Car Control System, built on python-telegram-bot
-(https://python-telegram-bot.org). Lets an authorized owner lock/unlock the
-door, start/stop the engine, and check status (fuel/battery/engine temp/cabin
-temp) remotely, and pushes a push notification when the anti-theft alarm
-triggers.
-
-The module is UI-agnostic like anti_theft.py: the host application
-(car_control.py) passes a dict of callables it uses to read/change car state:
-  - get_status:  callable() -> dict with keys
-                 door_locked, engine_on, fuel, battery, engine_temp, cabin_temp
-  - lock_door:   callable()        lock the door
-  - unlock_door: callable()        unlock the door
-  - engine_on:   callable()        start the engine
-  - engine_off:  callable()        stop the engine
-
-Those callables are expected to acquire car_control.py's state_lock
-themselves (same convention as anti_theft.py's callbacks), so this module
-never touches that lock directly.
-
-Configuration (bot token + allowed chat IDs + owner password) is read from
-environment variables, falling back to a local tele_config.json (see
-tele_config.example.json):
-  TELEGRAM_BOT_TOKEN   the bot token from @BotFather
-  TELEGRAM_CHAT_ID     comma-separated list of chat IDs allowed to issue commands
-  TELEGRAM_PASSWORD    the single owner password (users must /login before controlling)
-
-Only chat IDs in the allowlist can issue commands - anyone else gets an
-"unauthorized" reply that includes their own chat ID, so the owner can grab
-it and add it to the allowlist. In addition, control commands require the
-chat to have successfully authenticated via /login <password> (passwords are
-not stored after startup; login state lives only in memory for the chat).
-
-Digital keys (REQ): the owner generates a single-use share code with /share
-and sends it to a co-owner, who redeems it with /accept <code>. On success
-the co-owner's chat ID is added to the allowlist and persisted back into
-tele_config.json so it survives a restart. The code itself is one-time-only
-and lives only in memory.
-"""
-
 import asyncio
 import json
 import os
@@ -53,9 +10,7 @@ CONFIG_FILE = "tele_config.json"
 
 
 def _load_config():
-    """Read bot token / allowed chat IDs / owner password from env vars,
-    falling back to tele_config.json for whatever wasn't set via the
-    environment. Returns (token, chat_ids, password)."""
+    # Read bot token, allowed chat IDs, and password from env or config file
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_ids = {c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()}
     chat_ids = {int(c) for c in chat_ids}
@@ -70,7 +25,7 @@ def _load_config():
                 chat_ids = {int(c) for c in data.get("chat_ids", [])}
             password = password or data.get("password")
         except (FileNotFoundError, ValueError, OSError):
-            pass  # no config file - config stays whatever the env gave us (possibly empty)
+            pass
 
     return token, chat_ids, password
 
@@ -83,8 +38,8 @@ class TelegramBot:
         self.allowed_chat_ids = set(allowed_chat_ids) if allowed_chat_ids is not None else env_chat_ids
         self.password = password or env_password
 
-        self._authenticated = set()  # chat IDs that have successfully /login'd
-        self._share_codes = {}       # share code -> used flag (digital keys, single-use)
+        self._authenticated = set()
+        self._share_codes = {}
         self._application = None
         self._loop = None
         self._thread = None
@@ -93,9 +48,7 @@ class TelegramBot:
         return update.effective_chat.id in self.allowed_chat_ids
 
     def _persist_chat_ids(self):
-        """Write the current allowlist back into tele_config.json (creating it
-        fresh with the loaded token/password) so an accepted co-owner's chat
-        ID survives a restart. Best-effort - failures are logged, not raised."""
+        # Save updated chat IDs to tele_config.json
         try:
             data = {"token": self.token, "chat_ids": sorted(self.allowed_chat_ids)}
             if self.password:
@@ -113,8 +66,7 @@ class TelegramBot:
         )
 
     async def _require_auth(self, update: Update) -> bool:
-        """Rejects chats that aren't authorized OR haven't logged in yet.
-        Returns True if the caller may proceed."""
+        # Check authorization and login state
         if not self._authorized(update):
             await self._reply_unauthorized(update)
             return False
@@ -137,6 +89,7 @@ class TelegramBot:
             "/unlock - unlock the door\n"
             "/engine_on - start the engine\n"
             "/engine_off - stop the engine\n"
+            "/set_temp <temp> - set AC temperature (16-30C)\n"
             "/share - generate a one-time co-owner key\n"
             "/accept <code> - redeem a shared key (co-owners)\n"
             "/revoke <chat_id> - remove a co-owner's access (owner)\n"
@@ -167,13 +120,10 @@ class TelegramBot:
         await update.message.reply_text("Logged out.")
 
     async def _cmd_share(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Mint a one-time digital key for sharing access with a co-owner.
-        Only an allowlisted, logged-in user (the owner) can do this. The code
-        is returned to the caller to send to a co-owner, who redeems it with
-        /accept <code>."""
+        # Create a single-use share code
         if not await self._require_auth(update):
             return
-        code = os.urandom(4).hex()  # 8 hex chars, single-use
+        code = os.urandom(4).hex()
         self._share_codes[code] = False
         await update.message.reply_text(
             "Share code: /accept " + code + "\n"
@@ -181,10 +131,7 @@ class TelegramBot:
         )
 
     async def _cmd_accept(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Redeem a digital key to become an authorized co-owner. Anyone can
-        try, but only a valid, unused share code grants access. On success the
-        caller's chat ID is added to the allowlist and persisted so it
-        survives a restart."""
+        # Redeem a share code to get co-owner access
         if not context.args:
             await update.message.reply_text("Usage: /accept <share-code>")
             return
@@ -193,10 +140,10 @@ class TelegramBot:
             await update.message.reply_text("Invalid or already used share code.")
             return
 
-        self._share_codes[code] = True  # single-use
+        self._share_codes[code] = True
         chat_id = update.effective_chat.id
         self.allowed_chat_ids.add(chat_id)
-        self._authenticated.add(chat_id)  # grant implies immediate access
+        self._authenticated.add(chat_id)
         self._persist_chat_ids()
         await update.message.reply_text(
             "Access granted! You are now a co-owner of this car.\n"
@@ -204,9 +151,7 @@ class TelegramBot:
         )
 
     async def _cmd_revoke(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Remove a chat ID from the allowlist, revoking its access. Only the
-        owner (allowlisted + logged in) can do this. The co-owner's access is
-        removed immediately and persisted, so it also survives a restart."""
+        # Revoke access for a co-owner chat ID
         if not await self._require_auth(update):
             return
         if not context.args:
@@ -228,8 +173,7 @@ class TelegramBot:
         await update.message.reply_text(f"Revoked access for chat {chat_id}.")
 
     async def _cmd_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """List all authorized chat IDs, marking which are currently logged in.
-        Owner-only - lets the owner see who has access (useful before /revoke)."""
+        # Show all authorized chat IDs
         if not await self._require_auth(update):
             return
         if not self.allowed_chat_ids:
@@ -242,6 +186,7 @@ class TelegramBot:
         await update.message.reply_text("\n".join(lines))
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Display car status
         if not await self._require_auth(update):
             return
         status = self.controls["get_status"]()
@@ -280,12 +225,31 @@ class TelegramBot:
         self.controls["engine_off"]()
         await update.message.reply_text("Engine stopped.")
 
+    async def _cmd_set_temp(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Set AC temperature
+        if not await self._require_auth(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /set_temp <temperature> (e.g. /set_temp 25)")
+            return
+        try:
+            temp = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Invalid temperature - must be a whole number between 16 and 30.")
+            return
+
+        if "set_ac_temp" not in self.controls:
+            await update.message.reply_text("AC temperature control is not supported.")
+            return
+
+        success, msg = self.controls["set_ac_temp"](temp)
+        if success:
+            await update.message.reply_text(f"AC temperature set to {temp}C.")
+        else:
+            await update.message.reply_text(msg or "Failed to set AC temperature.")
+
     def start(self):
-        """Start the bot in its own background thread (with its own asyncio
-        event loop, since the rest of the app is plain threading, not
-        asyncio). Returns False without starting anything if no bot token is
-        configured, so a missing tele_config.json just disables remote
-        control instead of crashing the car control app."""
+        # Start Telegram polling thread
         if not self.token:
             print("Telegram bot disabled: no bot token configured (see tele_config.example.json).")
             return False
@@ -314,6 +278,7 @@ class TelegramBot:
         self._application.add_handler(CommandHandler("unlock", self._cmd_unlock))
         self._application.add_handler(CommandHandler("engine_on", self._cmd_engine_on))
         self._application.add_handler(CommandHandler("engine_off", self._cmd_engine_off))
+        self._application.add_handler(CommandHandler("set_temp", self._cmd_set_temp))
 
         self._loop.run_until_complete(self._application.initialize())
         self._loop.run_until_complete(self._application.start())
@@ -328,7 +293,7 @@ class TelegramBot:
             self._loop.run_until_complete(self._application.shutdown())
 
     def stop(self):
-        """Stop the bot's event loop and wait for its thread to exit."""
+        # Stop event loop and join thread
         if self._loop is None:
             return
         self._loop.call_soon_threadsafe(self._loop.stop)
@@ -336,10 +301,7 @@ class TelegramBot:
             self._thread.join(timeout=5)
 
     def notify_text(self, text):
-        """Push a message to every allowed chat ID. Fire-and-forget and
-        thread-safe - callable from any thread (e.g. the anti-theft alarm),
-        not just the bot's own. Silently does nothing if the bot never
-        started (no token configured)."""
+        # Send text notification to all allowed chats
         if self._loop is None or self._application is None:
             return
         for chat_id in self.allowed_chat_ids:
@@ -349,10 +311,7 @@ class TelegramBot:
             )
 
     def notify_photo(self, photo_path, caption=None):
-        """Push a photo (by file path) as an image message to every allowed
-        chat ID, with an optional caption. Same fire-and-forget, thread-safe
-        contract as notify_text. Silently does nothing if the bot never
-        started, and the photo is skipped if the file can't be opened."""
+        # Send photo notification to all allowed chats
         if self._loop is None or self._application is None:
             return
         for chat_id in self.allowed_chat_ids:
@@ -363,8 +322,6 @@ class TelegramBot:
 
 
 if __name__ == "__main__":
-    # Standalone smoke test (no hardware): status is fixed, lock/unlock and
-    # engine on/off just print instead of driving actuators.
     def fake_status():
         return {
             "door_locked": True,
