@@ -5,18 +5,35 @@ from unittest.mock import MagicMock, patch
 import car_control
 
 
-def test_simulation_readings_and_warmup(monkeypatch):
+def test_simulation_readings_and_warmup():
     """Test fuel drain, battery drain, and engine temperature simulation models."""
-    # Test fuel and battery drain math
-    monkeypatch.setattr(car_control, "SIM_START_TIME", 1000.0)
-    monkeypatch.setattr(time, "time", lambda: 1100.0)  # 100s elapsed
-    
-    # 100 - (0.05 * 100) = 95%
-    assert car_control.get_fuel_level() == 95
-    # 100 - (0.015 * 100) = 98.5 -> 98 or 99
-    assert car_control.get_battery_level() in (98, 99)
+    # 1. Fuel and battery should NOT drain when engine is OFF
+    with car_control.state_lock:
+        car_control.engine_on = False
+        car_control._fuel_level = 100.0
+        car_control._fuel_last_update = 1000.0
+        car_control._battery_level = 100.0
+        car_control._battery_last_update = 1000.0
 
-    # Test engine temperature warmup dynamics
+    with patch("time.time", return_value=1100.0):  # 100s elapsed
+        with car_control.state_lock:
+            assert car_control.get_fuel_level() == 100
+            assert car_control.get_battery_level() == 100
+
+    # 2. Fuel and battery SHOULD drain when engine is ON
+    with car_control.state_lock:
+        car_control.engine_on = True
+        car_control._fuel_last_update = 1100.0
+        car_control._battery_last_update = 1100.0
+
+    with patch("time.time", return_value=1200.0):  # 100s running
+        with car_control.state_lock:
+            # 100 - (0.05 * 100) = 95%
+            assert car_control.get_fuel_level() == 95
+            # 100 - (0.015 * 100) = 98.5 -> 98 or 99%
+            assert car_control.get_battery_level() in (98, 99)
+
+    # 3. Test engine temperature warmup dynamics
     with car_control.state_lock:
         car_control._engine_temp = 30.0
         car_control._engine_temp_last_update = 1000.0

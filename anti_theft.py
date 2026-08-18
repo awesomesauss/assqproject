@@ -16,82 +16,41 @@ DEFAULT_CAPTURE_DIR = "captures"
 
 
 class _Camera:
-    """Helper class to manage Raspberry Pi camera capture."""
+    """Helper class to manage Raspberry Pi camera capture via libcamera-still."""
 
     def __init__(self):
-        self._impl = None
+        self._available = False
         self._lock = threading.Lock()
 
     def open(self):
-        # Try initializing picamera2 first
-        try:
-            from picamera2 import Picamera2
-            cam = Picamera2()
-            cam.configure(cam.create_still_configuration())
-            cam.start()
-            self._impl = ("picamera2", cam)
-            print("Camera ready (picamera2)")
-            return
-        except Exception as picamera2_exc:
-            print("Warning: picamera2 init failed (" + str(picamera2_exc) + ")")
-
-        # Fallback to libcamera-still command line
+        # Check if libcamera-still CLI is available
         if shutil.which("libcamera-still"):
-            self._impl = ("cli", None)
+            self._available = True
             print("Camera ready (libcamera-still)")
-            return
-
-        # Fallback to legacy picamera
-        try:
-            import picamera
-            cam = picamera.PiCamera()
-            cam.resolution = (1024, 768)
-            self._impl = ("picamera", cam)
-            print("Camera ready (picamera)")
-        except Exception as exc:
-            print("Warning: camera unavailable - theft photos disabled (" + str(exc) + ")")
+        else:
+            print("Warning: libcamera-still unavailable - theft photos disabled")
 
     def capture(self, path):
-        # Take photo and save to path
+        # Take photo using libcamera-still and save to path
         with self._lock:
-            if self._impl is None:
+            if not self._available:
                 return False
-            kind, cam = self._impl
             try:
-                if kind == "picamera2":
-                    cam.capture_file(path)
-                elif kind == "cli":
-                    result = subprocess.run(
-                        ["libcamera-still", "--output", path, "--nopreview", "--timeout", "2000"],
-                        capture_output=True, timeout=20,
-                    )
-                    if result.returncode != 0:
-                        detail = result.stderr.decode(errors="replace").strip()
-                        print("Warning: libcamera-still failed (" + detail + ")")
-                        return False
-                else:
-                    cam.capture(path)
+                result = subprocess.run(
+                    ["libcamera-still", "--output", path, "--nopreview", "--timeout", "2000"],
+                    capture_output=True, timeout=20,
+                )
+                if result.returncode != 0:
+                    detail = result.stderr.decode(errors="replace").strip()
+                    print("Warning: libcamera-still failed (" + detail + ")")
+                    return False
                 return True
             except Exception as exc:
                 print("Warning: camera capture failed (" + str(exc) + ")")
                 return False
 
     def close(self):
-        with self._lock:
-            if self._impl is None:
-                return
-            kind, cam = self._impl
-            if kind == "picamera2":
-                try:
-                    cam.stop()
-                except Exception:
-                    pass
-            elif kind == "picamera":
-                try:
-                    cam.close()
-                except Exception:
-                    pass
-            self._impl = None
+        self._available = False
 
 
 class AntiTheftMonitor:

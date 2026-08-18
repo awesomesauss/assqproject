@@ -7,15 +7,13 @@ from anti_theft import AntiTheftMonitor, _Camera
 
 
 def test_camera_backend_cascade_and_capture(tmp_path):
-    """Test camera backend fallbacks and capture behavior."""
+    """Test libcamera-still camera availability and capture behavior."""
     cam = _Camera()
 
-    # 1. Fallback to CLI backend when libcamera-still is available
+    # 1. Available when libcamera-still CLI exists
     with patch("shutil.which", return_value="/usr/bin/libcamera-still"):
-        with patch.dict("sys.modules", {"picamera2": None}):
-            cam.open()
-            assert cam._impl is not None
-            assert cam._impl[0] == "cli"
+        cam.open()
+        assert cam._available is True
 
     # 2. Capture success via subprocess mock
     photo_file = str(tmp_path / "test.jpg")
@@ -27,7 +25,7 @@ def test_camera_backend_cascade_and_capture(tmp_path):
         assert cam.capture(photo_file) is False
 
     cam.close()
-    assert cam._impl is None
+    assert cam._available is False
 
 
 def test_monitor_init_start_stop_lifecycle():

@@ -48,21 +48,37 @@ FUEL_DRAIN_RATE = 0.05
 BATTERY_LEVEL_START = 100.0
 BATTERY_DRAIN_RATE = 0.015
 
-SIM_START_TIME = time.time()
+_fuel_level = float(FUEL_LEVEL_START)
+_fuel_last_update = time.time()
+
+_battery_level = float(BATTERY_LEVEL_START)
+_battery_last_update = time.time()
 
 
 def get_fuel_level():
-    # Calculate fuel drain based on time
-    elapsed = time.time() - SIM_START_TIME
-    level = FUEL_LEVEL_START - (FUEL_DRAIN_RATE * elapsed)
-    return max(0, int(round(level)))
+    # Drain fuel only when engine is on
+    global _fuel_level, _fuel_last_update
+    now = time.time()
+    elapsed = now - _fuel_last_update
+    _fuel_last_update = now
+
+    if engine_on and _fuel_level > 0:
+        _fuel_level = max(0.0, _fuel_level - (FUEL_DRAIN_RATE * elapsed))
+
+    return int(round(_fuel_level))
 
 
 def get_battery_level():
-    # Calculate battery drain based on time
-    elapsed = time.time() - SIM_START_TIME
-    level = BATTERY_LEVEL_START - (BATTERY_DRAIN_RATE * elapsed)
-    return max(0, int(round(level)))
+    # Drain battery only when engine is on
+    global _battery_level, _battery_last_update
+    now = time.time()
+    elapsed = now - _battery_last_update
+    _battery_last_update = now
+
+    if engine_on and _battery_level > 0:
+        _battery_level = max(0.0, _battery_level - (BATTERY_DRAIN_RATE * elapsed))
+
+    return int(round(_battery_level))
 
 
 def get_engine_temperature():
